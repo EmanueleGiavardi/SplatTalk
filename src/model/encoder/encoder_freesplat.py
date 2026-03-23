@@ -117,8 +117,10 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         self.depth_range = depth_range
 
+        # gestisce le dimensioni dei parametri delle gaussiane
         self.gaussian_adapter = GaussianAdapter(cfg.gaussian_adapter)
 
+        # backbone CNN (pretrained), per feature extraction dalle immagini
         self.backbone = timm.create_model(
                                         "tf_efficientnetv2_s_in21ft1k", 
                                         pretrained=True, 
@@ -129,29 +131,43 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         cfg.enc_depth = 64
 
+        # modulo composto da 5 rami convoluzionali (Conv2D + ReLU)
+        # ogni blocco prende in input immagini RGB (3 canali) e produce features con una 
+        # profondità cfg.enc_depth (64)
+        # ognuno di questi rami estrae features delle immagini a diversi livelli di dettaglio (più si 
+        # aumenta il downsampling, più il livello di dettaglio diminuisce, estraendo features più generiche)
+        # Le 5 feature maps prodotte sono reintrodotte più avanti nell'architettura (skip connections)
         self.high_resolution_skip = nn.ModuleList(
+                                # mantiene risoluzione di input
                                 [nn.Sequential(
                                     nn.Conv2d(3, cfg.enc_depth, 7, 1, 3),
                                     activation_func,
                                 ),
+                                # downsampling 2X
                                 nn.Sequential(
                                     nn.Conv2d(3, cfg.enc_depth, 6, 2, 2),
                                     activation_func,
                                 ),
+                                # downsampling 4X
                                 nn.Sequential(
                                     nn.Conv2d(3, cfg.enc_depth, 8, 4, 2),
                                     activation_func,
                                 ),
+                                # downsampling 8X
                                 nn.Sequential(
                                     nn.Conv2d(3, cfg.enc_depth, 16, 8, 4),
                                     activation_func,
                                 ),
+                                # downsampling 16X
                                 nn.Sequential(
                                     nn.Conv2d(3, cfg.enc_depth, 32, 16, 8),
                                     activation_func,
                                 )]
                             )
 
+        # layer finale: MLP che emette i parametri delle gaussiane.
+        # Prende in input cfg.enc_depth (le 64 dimensioni della feature latente uscita dalla GRU) 
+        # e sputa fuori i parametri finali per il Gaussian Splatting (tramite self.gaussian_adapter.d_in).
         self.to_gaussians = nn.Sequential(
             activation_func,
             nn.Linear(
@@ -162,16 +178,25 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         self.gausisans_ch = cfg.num_surfaces * (2 + self.gaussian_adapter.d_in)
         
+        # Crea un volume di "costo" campionando lo spazio 3D lungo i raggi della camera
+        # Confronta le feature tra viste diverse per trovare dove i pixel "concordano", 
+        # identificando così la profondità corretta
         self.cost_volume = AVGFeatureVolumeManager(matching_height=self.cfg.image_H//4, 
                                                     matching_width=self.cfg.image_W//4,
                                                     num_depth_bins=self.cfg.num_depth_candidates,
                                                     matching_dim_size=48,)
+        
+        # processa il volume di costo e lo fonde con le feature estratte dalla CNN
         self.cv_encoder = CVEncoder(num_ch_cv=self.cfg.num_depth_candidates,
                                     num_ch_enc=self.backbone.num_ch_enc[1:],
                                     num_ch_outs=[64, 128, 256, 384])
         dec_num_input_ch = (self.backbone.num_ch_enc[:1] 
                                         + self.cv_encoder.num_ch_enc)
 
+        # Prende le feature fuse dal cv_encoder e genera: 
+        # - Mappe di Profondità: Dove si trovano i punti nello spazio
+        # - Feature Map Geometriche: Un vettore di dimensione cfg.enc_depth (64) per ogni pixel, 
+        #                            che contiene l'informazione visiva raffinata
         self.depth_decoder = DepthDecoder(dec_num_input_ch, 
                                             num_output_channels=1+cfg.enc_depth,
                                             near=depth_range[0],
@@ -183,6 +208,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         self.weight_embedding = nn.Sequential(nn.Linear(2, 12), 
                                     activation_func,
                                     nn.Linear(12, 12),)
+        # La GRU viene usata per fondere informazioni provenienti da diverse viste
         self.gru = GRU(input_channel=cfg.enc_depth, hidden_channel=cfg.enc_depth)
 
     def map_pdf_to_opacity(
@@ -202,7 +228,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
     
     def forward(
         self,
-        context,
+        context,  # -> dizionario con le immagini e le info delle camere
         global_step: int,
         deterministic: bool = False,
         visualization_dump: Optional[dict] = None,
@@ -372,7 +398,11 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         our_gaussians = []
         num_raw_gaussians = gaussians[0].shape[2] * gaussians[0].shape[1]
         B = gaussians[0].shape[0]
+
+        # qui iteriamo sulle DIVERSE SCENE, NON SU VISTE DIVERSE DELLA STESSA SCENA
+        # 
         for b in range(B):
+            # "cur" -> scena corrente
             cur_gs = [x[b:b+1] for x in gaussians]
             cur_coords = [x[b:b+1] for x in coords]
             cur_densities = densities[b:b+1]
@@ -384,11 +414,17 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                                             context["extrinsics"][b:b+1], \
                                             context["intrinsics"][b:b+1], context['image_shape'])
 
+            # cur_gaussians -> feature fuse a partire dalle triplette (vettori 64 dim)
+            # cur_gaussians_now -> output del Gaussian Latent Decoder: vettore che contiene, per ogni Gaussiana,
+            # 256 valori semantici + scala + rotazione + colori SH
+            
             cur_gaussians_now = rearrange(
                             self.to_gaussians(cur_gaussians),
                             "... (srf c) -> ... srf c",
                             srf=self.cfg.num_surfaces,
                         )
+            
+            # chiamata alla forward del Gaussian Adapter, per split dei parametri delle gaussiane a partire da cur_gaussians_now
             cur_gaussians = self.gaussian_adapter.forward(
                 rearrange(cur_extrinsics, "b r i j -> b () r () () i j"),
                 repeat(context["intrinsics"][b:b+1,0], "b i j -> b () N () () i j", N=cur_gaussians_now.shape[1]),
@@ -400,7 +436,9 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                 fusion=False,
                 coords=rearrange(cur_coords, "b r c -> b () r () () c"),
             )
+            # our_gaussians è una lista di nuvole gaussiane, una per ogni scena
             our_gaussians.append(cur_gaussians)
+
         num_gaussians = our_gaussians[0].means.shape[2]
         results['gs_ratio'] = num_gaussians / num_raw_gaussians
         results['num_gaussians'] = num_gaussians
@@ -422,6 +460,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         results['visualizations'] = visualization_dump
 
         final_gs = []
+        # itera sulle nuvole gaussiane associate a ciascuna scena
         for i in range(len(our_gaussians)):
             final_gs.append(Gaussians(
                 rearrange(
@@ -445,6 +484,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                     "b v r srf spp c -> b (v r srf spp) c"
                 )
             ))
+        # lista finale in cui ogni elemento è una scane 3D completa composta da Gaussiane 
         results['gaussians'] = final_gs
         torch.cuda.empty_cache()
 
