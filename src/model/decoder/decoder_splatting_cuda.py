@@ -50,8 +50,9 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         b, v, _, _ = extrinsics.shape
         if not no_color:
             # updated_gaussians = self.viewdependent(gaussians, extrinsics)
-            updated_gaussians = gaussians.features
+            updated_gaussians = gaussians.features # piglia le features semantiche
 
+            # qui viene chiamato il rasterizzatore cuda
             color, depth, language = render_cuda(
                 rearrange(extrinsics, "b v i j -> (b v) i j"),
                 rearrange(intrinsics, "b v i j -> (b v) i j"),
@@ -65,10 +66,20 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
                 repeat(gaussians.opacities, "b g -> (b v) g", v=v),
                 repeat(updated_gaussians, "b g c -> (b v) g c", v=v)
             )
-            color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
+            
+            # color è il prodotto del rasterizzatore: viene rearrangeato in un tensore [b v c h w], ovvero
+            # ovvero un immagine h*w (per ciascun canale colore c) per ogni vista v di ciascuna scena (batch) b
+            color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v) 
             depth = rearrange(depth, "(b v) c h w -> b v c h w", b=b, v=v).squeeze(2)
             depth = depth / 2
 
+            # language è invece la feature map semantica: anche qui abbiamo un tensore [b v c h w]
+            # anche qui, per ogni pixel dell'immagine (h * w) c'è un vettore semantico di c (256) elementi 
+            # quando il rasterizzatore disegna un pixel, guarda tutte le Gaussiane che cadono in quel punto, le ordina per profondità e le fonde usando l'opacità
+            # ogni pixel eredita il significato semantico delle gaussiane che lo "riguardano"
+            
+            # serve downsampling per compatibilità con la pseudo-ground truth (l'immagine veniva divisa in 27 x 27 blocchi, e si aveva un vettore semantico
+            # per ciascun blocco) ??
             language = rearrange(language, "(b v) c h w -> b v c h w", b=b, v=v)
         
         else:

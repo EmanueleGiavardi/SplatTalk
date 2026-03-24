@@ -228,7 +228,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
     
     def forward(
         self,
-        context,  # -> dizionario con le immagini e le info delle camere
+        context,  # -> dizionario con le immagini e le info delle camere (shape è di tipo BatchedViews)
         global_step: int,
         deterministic: bool = False,
         visualization_dump: Optional[dict] = None,
@@ -403,11 +403,11 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
         # 
         for b in range(B):
             # "cur" -> scena corrente
-            cur_gs = [x[b:b+1] for x in gaussians]
-            cur_coords = [x[b:b+1] for x in coords]
-            cur_densities = densities[b:b+1]
-            cur_weights = weights[b:b+1]
-            cur_depth = rearrange(depth_outputs[f'depth_pred_s-1_b1hw'], "(b v) c h w -> b v c h w", b=B)[b]
+            cur_gs = [x[b:b+1] for x in gaussians]  # --> f ∈ R^(C-1) * HW 
+            cur_coords = [x[b:b+1] for x in coords] # --> μ ∈ R^3 * HW 
+            cur_densities = densities[b:b+1]        # --> ω ∈ R^1 * HW 
+            cur_weights = weights[b:b+1]            # --> pesi di confidenza sulle distanze stimate
+            cur_depth = rearrange(depth_outputs[f'depth_pred_s-1_b1hw'], "(b v) c h w -> b v c h w", b=B)[b]  ## --> distanze stimate (mappa di profondità)
             cur_gaussians, cur_coords, cur_extrinsics, cur_depths, cur_densities, cur_weights = self.fuse_gaussians(cur_gs, cur_coords, 
                                             cur_densities, cur_weights, 
                                             cur_depth, 
@@ -461,11 +461,22 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
 
         final_gs = []
         # itera sulle nuvole gaussiane associate a ciascuna scena
+        # b -> batch_size: numero di SCENE diverse processate contemporaneamente
+        # v -> views: numero di VISTE/ANGOLATURE diverse della stessa scena
+        # r -> numero totale di pixel della singola view
+        # srf -> surfaces: numero di gaussiane "sovrapposte" create per ciascun pixel (spesso 1)
+        # spp -> samples-per-pixel: numero di campioni di profondità presi lungo il raggio della camera
+        # xyz -> spazio dimensionale del modello 3D (quindi 3)
+        # c -> channels (canali colore) / (PER LE FEATURES) dimensione del vettore latente semantico
+        # d_sh -> coefficienti delle armoniche sferiche
         for i in range(len(our_gaussians)):
             final_gs.append(Gaussians(
                 rearrange(
                     our_gaussians[i].means,
-                    "b v r srf spp xyz -> b (v r srf spp) xyz",
+                    # nel rearrange si crea una nuova dimensione moltiplicando v, r, srf e spp. Il valore di questo prodotto
+                    # è proprio il numero di Gaussiane della nuvola. 
+                    # dunque passiamo da un tensore di 6 ad un tensore di 3 dimensioni, in cui la seconda dimensione è relativa al numero di gaussiane nella scena
+                    "b v r srf spp xyz -> b (v r srf spp) xyz", 
                 ),
                 rearrange(
                     our_gaussians[i].covariances,
@@ -484,7 +495,7 @@ class EncoderFreeSplat(Encoder[EncoderFreeSplatCfg]):
                     "b v r srf spp c -> b (v r srf spp) c"
                 )
             ))
-        # lista finale in cui ogni elemento è una scane 3D completa composta da Gaussiane 
+        # lista finale in cui ogni elemento è una scena 3D completa composta da Gaussiane 
         results['gaussians'] = final_gs
         torch.cuda.empty_cache()
 
